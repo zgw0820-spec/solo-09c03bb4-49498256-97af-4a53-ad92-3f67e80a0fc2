@@ -9,8 +9,13 @@ Flow:
   recomputed by surviving workers from the original files; intact shards are
   reused. Merges that read a lost shard but have not committed are
   invalidated and re-run; late commits from invalidated tasks are fenced by
-  epochs and never reach the report. The report is shown only after every
-  merge has committed.
+  epochs and never reach the report.
+- Once every merge has committed the job enters PUBLISH: the merge results are
+  final and kept on shared storage. A background publisher builds report.json
+  and retries on write failure; while it retries, worker deaths do not
+  recompute shards or re-run merges (they are no longer needed), and a
+  coordinator restart resumes publishing from the persisted state. The report
+  is shown only after report.json has been written successfully.
 """
 from __future__ import annotations
 
@@ -38,8 +43,21 @@ STATE_PATH = os.path.join(DATA_DIR, "state", "state.json")
 HEARTBEAT_TIMEOUT = float(os.environ.get("HEARTBEAT_TIMEOUT", "10"))
 NPARTITIONS = int(os.environ.get("JOB_PARTITIONS", "8"))
 
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+# Report publishing: retried in the background until report.json is written.
+PUBLISH_RETRY_MIN = max(0.05, _env_float("PUBLISH_RETRY_MS", 500) / 1000.0)
+PUBLISH_RETRY_MAX = max(PUBLISH_RETRY_MIN, _env_float("PUBLISH_RETRY_MAX_MS", 3000) / 1000.0)
+
 store = Store(STATE_PATH)
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
+_publish_wakeup = threading.Event()
 
 
 # ------------------------------------------------------------------ helpers
@@ -65,9 +83,21 @@ def shard_key(fid: str, part: int) -> str:
 def job_phase(job: dict) -> str:
     if job["done"]:
         return "COMPLETE"
+    if job.get("publish"):
+        return "PUBLISH"
     if all(m["state"] == "DONE" for m in job["maps"].values()):
         return "REDUCE"
     return "MAP"
+
+
+def reduces_final(job: dict) -> bool:
+    """Every merge committed: results are frozen, shards/maps are irrelevant."""
+    return all(rd["state"] == "COMMITTED" for rd in job["reduces"].values())
+
+
+def results_final(job: dict) -> bool:
+    """The accepted result set is fixed: publishing (done or pending)."""
+    return bool(job["done"] or job.get("publish") or reduces_final(job))
 
 
 def refresh_reduces(job: dict) -> None:
@@ -105,17 +135,30 @@ def _invalidate_reduces(job: dict) -> None:
             rd["state"] = "PENDING"
 
 
-def _lose_shards(job: dict, keys: list, reason: str) -> None:
-    """Mark shards lost, schedule recompute of their files, invalidate merges."""
+def _mark_lost(job: dict, keys: list, reason: str) -> int:
+    """Flip OK shards to LOST (bookkeeping only). Returns how many were lost."""
     lost = 0
     for k in keys:
         s = job["shards"].get(k)
         if s and s["status"] == "OK":
             s["status"] = "LOST"
             lost += 1
+    if lost:
+        log_event(job, f"{reason}: {lost} shard(s) LOST")
+    return lost
+
+
+def _lose_shards(job: dict, keys: list, reason: str) -> None:
+    """Mark shards lost, schedule recompute of their files, invalidate merges."""
+    lost = _mark_lost(job, keys, reason)
     if not lost:
         return
-    log_event(job, f"{reason}: {lost} shard(s) LOST")
+    if results_final(job):
+        # Results already accepted (or being published): shards are no longer
+        # inputs of anything, so a loss must not trigger recompute or re-run.
+        log_event(job, "all merges already committed; accepted merge results "
+                       "kept, no recompute scheduled")
+        return
     for fid in {k.split(":")[0] for k in keys}:
         m = job["maps"][fid]
         if m["state"] == "DONE":
@@ -137,6 +180,17 @@ def on_worker_dead(wid: str, reason: str) -> None:
         job = store.data["jobs"][jid]
         if job["done"]:
             continue
+        if results_final(job):
+            # Every merge is committed and its output lives on shared storage:
+            # the shards it consumed are no longer inputs of anything. Record
+            # the loss for the UI, but do NOT recompute or re-run anything.
+            lost_keys = [k for k, s in job["shards"].items()
+                         if s["worker"] == wid and s["status"] == "OK"]
+            lost = _mark_lost(job, lost_keys, f"worker {wid} {reason}")
+            log_event(job, f"all merges already committed - {lost} shard(s) "
+                           f"no longer needed; job keeps its results and "
+                           f"publishes without recompute")
+            continue
         # tasks running on the dead worker are gone with it
         for fid, m in job["maps"].items():
             if m["state"] == "ASSIGNED" and m["worker"] == wid:
@@ -157,7 +211,12 @@ def on_worker_dead(wid: str, reason: str) -> None:
         refresh_reduces(job)
 
 
-def build_report(job: dict) -> None:
+def _collect_report(job: dict) -> dict:
+    """Build the report from the committed merge outputs only.
+
+    The reduce outputs are the accepted result set; nothing here reads shards,
+    so publishing keeps working even if every worker has gone away.
+    """
     records = []
     for p in range(job["r"]):
         out = job["reduces"][str(p)]["output"]
@@ -165,9 +224,11 @@ def build_report(job: dict) -> None:
             records.extend(json.load(f)["records"])
     still = [r for r in records if r["attempts"] >= 2 and 500 <= r["s"] < 600]
     still.sort(key=lambda r: r["rid"])
-    job["report"] = {
-        "total_records": sum(s["records"] for s in job["shards"].values()
-                             if s["status"] == "OK"),
+    # Each valid input record lands in exactly one (file, partition) shard and
+    # is folded into exactly one request entry, so the attempts sum is the
+    # accepted record count - independent of later shard loss.
+    return {
+        "total_records": sum(r["attempts"] for r in records),
         "total_requests": len(records),
         "retried": sum(1 for r in records if r["attempts"] >= 2),
         "still_5xx": [
@@ -178,26 +239,110 @@ def build_report(job: dict) -> None:
         "single_5xx": sum(1 for r in records
                           if r["attempts"] == 1 and 500 <= r["s"] < 600),
     }
-    with open(os.path.join(MERGE_DIR, job["id"], "report.json"), "w",
-              encoding="utf-8") as f:
-        json.dump(job["report"], f, indent=1)
+
+
+def _report_path(job: dict) -> str:
+    return os.path.join(MERGE_DIR, job["id"], "report.json")
+
+
+def _write_report(report: dict, path: str) -> None:
+    """Atomically write report.json; raises on any I/O failure."""
+    tmp = path + f".tmp-{os.getpid()}-{threading.get_ident()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    try:
+        dfd = os.open(os.path.dirname(path), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+
+
+def _publish(job: dict) -> bool:
+    """One publish attempt, retried in the background until it succeeds.
+
+    File I/O happens outside ``store.lock`` so a stuck write cannot block the
+    web UI or task assignment. Only the short state transitions are locked.
+    On success the job becomes done (report visible). On failure the accepted
+    results stay untouched and the caller retries later; ``publish`` survives
+    a coordinator restart, so publishing resumes from the persisted state.
+    """
+    jid = job["id"]
+    try:
+        path = _report_path(job)
+        report = _collect_report(job)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        _write_report(report, path)
+    except Exception as e:  # noqa: BLE001 - any write failure must be retried
+        with store.lock:
+            cur = store.data["jobs"].get(jid)
+            pub = cur and cur.get("publish")
+            if not pub or cur["done"]:
+                return False
+            pub["fails"] = pub.get("fails", 0) + 1
+            pub["last_error"] = f"{type(e).__name__}: {e}"
+            delay = min(PUBLISH_RETRY_MAX,
+                        PUBLISH_RETRY_MIN * (2 ** min(pub["fails"] - 1, 8)))
+            pub["next_try"] = now() + delay
+            if pub["fails"] == 1 or pub["fails"] % 20 == 0:
+                log_event(cur, f"report publish FAILED ({pub['last_error']}); "
+                               f"merge results kept on shared storage, retrying "
+                               f"every {delay:.1f}s - attempt {pub['fails']}")
+            try:
+                store.save()
+            except OSError:
+                pass  # in-memory commit state is kept; retried by the publisher
+        return False
+    with store.lock:
+        cur = store.data["jobs"].get(jid)
+        if not cur or cur["done"]:
+            return True
+        cur["report"] = report
+        cur["publish"].update(state="DONE", done_at=iso(), last_error=None)
+        cur["done"] = True
+        log_event(cur, f"report published: {len(report['still_5xx'])} requests "
+                       f"still 5xx after retry (of {report['total_requests']} "
+                       f"requests)")
+        store.save()
+    return True
 
 
 def maybe_complete(job: dict) -> None:
-    if not job["done"] and all(rd["state"] == "COMMITTED"
-                               for rd in job["reduces"].values()):
-        build_report(job)
-        job["done"] = True
-        log_event(job, f"job COMPLETE: {len(job['report']['still_5xx'])} requests "
-                       f"still 5xx after retry (of {job['report']['total_requests']} "
-                       f"requests)")
+    """Enter the publish phase once every merge is committed.
+
+    Only marks the job; the publisher thread does the (possibly slow) file I/O
+    outside ``store.lock``. Caller holds the lock.
+    """
+    if job["done"] or job.get("publish"):
+        return
+    if not reduces_final(job):
+        return
+    job["publish"] = {"state": "PENDING", "since": iso(), "fails": 0,
+                      "next_try": 0.0, "last_error": None}
+    log_event(job, "all merges committed; results are final - publishing report "
+                   "(a worker dying from now on does not trigger recompute)")
+    store.save()
+    _publish_wakeup.set()
 
 
 def assign_task(wid: str):
     """Pick the next task for a worker. Caller holds store.lock."""
     for jid in store.data["order"]:
         job = store.data["jobs"][jid]
-        if job["done"]:
+        if results_final(job):
+            # done or publishing: no new task can change the report
             continue
         for fid in job["files"]:
             m = job["maps"][fid]
@@ -237,11 +382,55 @@ def _peer_alive(base_url: str) -> bool:
 
 # ------------------------------------------------------------------ app
 
+def _recover_after_restart() -> None:
+    """Caller must hold store.lock.
+
+    Tasks the previous coordinator process had handed out can no longer
+    commit: the worker may have died with it, or its commit POST may have been
+    lost. Re-enqueue them with a new epoch; a late commit from the old attempt
+    is fenced and discarded. Committed merges are never touched.
+    """
+    for jid in store.data["order"]:
+        job = store.data["jobs"][jid]
+        if results_final(job):
+            continue
+        recovered = 0
+        for m in job["maps"].values():
+            if m["state"] == "ASSIGNED":
+                m.update(state="PENDING", worker=None)
+                m["epoch"] += 1
+                recovered += 1
+        for rd in job["reduces"].values():
+            # ASSIGNED only: READY/PENDING/COMMITTED carry no in-flight write
+            if rd["state"] == "ASSIGNED":
+                rd.update(state="PENDING", worker=None)
+                rd["epoch"] += 1
+                recovered += 1
+        if recovered:
+            log_event(job, f"coordinator restart: {recovered} in-flight task(s) "
+                           f"re-enqueued with a new epoch (their old attempts can "
+                           f"no longer commit)")
+            refresh_reduces(job)
+    store.save()
+
+
 @asynccontextmanager
 async def lifespan(_app):
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     os.makedirs(MERGE_DIR, exist_ok=True)
+    with store.lock:
+        _recover_after_restart()
+        # A coordinator restart must not strand a job whose merges were all
+        # accepted: resume publishing from the persisted state.
+        for job in store.data["jobs"].values():
+            if job["done"]:
+                continue
+            if job.get("publish"):
+                _publish_wakeup.set()
+            elif reduces_final(job):
+                maybe_complete(job)
     threading.Thread(target=_reaper, daemon=True).start()
+    threading.Thread(target=_publisher, daemon=True).start()
     yield
 
 
@@ -259,6 +448,22 @@ def _reaper() -> None:
                         on_worker_dead(wid, "heartbeat timeout")
         except Exception:  # noqa: BLE001 - the reaper must never die
             pass
+
+
+def _publisher() -> None:
+    """Retry failed report writes in the background; never lose the results."""
+    while True:
+        try:
+            with store.lock:
+                due = [job for job in store.data["jobs"].values()
+                       if not job["done"] and job.get("publish")
+                       and now() >= job["publish"].get("next_try", 0)]
+            for job in due:
+                _publish(job)
+        except Exception:  # noqa: BLE001 - the publisher must never die
+            pass
+        _publish_wakeup.wait(0.25)
+        _publish_wakeup.clear()
 
 
 # ------------------------------------------------------------- UI pages
@@ -368,6 +573,7 @@ def job_page(request: Request, jid: str):
                                 if r["state"] == "COMMITTED"),
             "reduces": sorted(job["reduces"].items(), key=lambda kv: int(kv[0])),
             "events": list(reversed(job["events"])),
+            "publish": job.get("publish"),
         }
     return templates.TemplateResponse(request=request, name="job.html", context=ctx)
 
@@ -623,6 +829,7 @@ def job_status(jid: str):
             raise HTTPException(404, "unknown job")
         return {"id": jid, "phase": job_phase(job), "done": job["done"],
                 "maps": job["maps"], "reduces": job["reduces"],
+                "publish": job.get("publish"),
                 "shards_ok": sum(1 for s in job["shards"].values()
                                  if s["status"] == "OK"),
                 "shards_lost": sum(1 for s in job["shards"].values()
@@ -638,6 +845,11 @@ def job_report(jid: str):
         if not job:
             raise HTTPException(404, "unknown job")
         if not job["done"]:
-            raise HTTPException(409, "job not complete - the report is shown only "
-                                     "after all merges finish")
+            pub = job.get("publish")
+            reason = ("all merges are committed; the report is being published "
+                      "and is shown once the write succeeds"
+                      if pub else
+                      "job not complete - the report is shown only after all "
+                      "merges finish")
+            raise HTTPException(409, reason)
         return job["report"]

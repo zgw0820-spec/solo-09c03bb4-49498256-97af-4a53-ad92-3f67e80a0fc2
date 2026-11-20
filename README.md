@@ -6,6 +6,11 @@
 分片继续复用；读过丢失分片、尚未完成的归并作废重跑，作废任务的迟到
 结果不会进入报告。全部归并完成后才显示清单，每个请求以最新记录为准。
 
+归并结果一旦被协调器接收就**保留**：全部归并提交后任务进入 `PUBLISH`
+阶段，报告写入失败会在后台重试；等待发布期间即使工作进程掉线、中间分片
+丢失，也不补算分片、不重跑归并；协调器重启后从持久化状态继续发布。报告
+文件写成功之前，网页与 `/api/jobs/{id}/report` 只显示进度（HTTP 409）。
+
 ## 架构
 
 ```
@@ -35,6 +40,13 @@
   派发补算；读过丢失分片且未提交的归并 epoch+1 作废重跑；作废任务的
   迟到提交因 epoch 不符被 409 拒绝并删除临时文件，**不进报告**。已提交
   的归并不重跑——map 是确定性的，补算出的分片与原来逐字节一致。
+- **发布**：全部分区 COMMITTED 后结果集冻结（`publish` 状态写入
+  `state.json`）。协调器只从归并输出构造报告，原子写 `report.json`
+  （临时文件 + fsync + rename）；失败时指数退避重试（`PUBLISH_RETRY_MS`
+  默认 500ms，上限 `PUBLISH_RETRY_MAX_MS` 默认 3s），写文件在锁外进行、
+  不阻塞页面。期间工作进程掉线只把分片记为 LOST 供展示、不触发补算/重跑。
+  协调器启动时恢复发布，并把上一个进程遗留的 ASSIGNED 任务（提交可能已
+  丢失）以新 epoch 重新排队，迟到提交被拒。
 - **掉线检测**有三条路径：网页主动停（立即）、心跳超时（10 秒）、幸存
   进程拉取分片失败上报（协调器健康检查确认后标记）。
 
@@ -68,6 +80,26 @@ python3 scripts/verify.py http://localhost:8000
 A 清单 == 期望清单；B 清单 == A 清单；完成前 /report 返回 409；只补算掉线
 进程的分片；作废归并的迟到提交被拒。另附事件回放。
 
+## 核对（报告写入失败 → 掉线 → 协调器重启）
+
+```bash
+# 本机方式：DATA_DIR 对本脚本可见，--restart-cmd 只重启协调器
+python3 scripts/verify_publish.py --data-dir /tmp/d \
+    --restart-cmd "sh /tmp/restart-coordinator.sh"
+
+# Docker Compose（在宿主机运行；用 exec 操作容器内数据卷）
+python3 scripts/verify_publish.py --data-dir /data \
+    --restart-cmd "docker compose restart web" \
+    --block-cmd "docker compose exec -T web mkdir -p {path}" \
+    --unblock-cmd "docker compose exec -T web rm -rf {path}"
+```
+
+脚本用同一批日志：先不注入故障跑任务 A 得到基准报告；再造一个报告写入
+必然失败的任务 B（`merge/<job>/report.json` 被同名目录占位，写入 rename
+失败），在 B 进入 `PUBLISH` 后停掉一个工作进程、再重启协调器；断言：
+发布前网页/report 只显示进度（409）；掉线与重启后分片不补算、归并不重跑、
+epoch 不变；清除故障后 B 的报告自动发布并与 A 的报告逐字段一致。
+
 ## 本地开发（无 Docker）
 
 ```bash
@@ -94,11 +126,13 @@ app/web/templates/   页面模板
 app/worker/worker.py 工作进程（map/reduce、分片服务、控制面）
 scripts/gen_logs.py  确定性测试日志生成（含期望清单）
 scripts/verify.py    端到端核对脚本
+scripts/verify_publish.py  报告写入失败/掉线/协调器重启的核对脚本
 ```
 
 ## 遗留事项
 
-- 单协调器、状态存 JSON 文件，无高可用；生产应换数据库 + 选主。
+- 单协调器、状态存 JSON 文件，无高可用；生产应换数据库 + 选主。归并结果
+  在共享卷上，协调器重启可继续发布，但发布期间协调器停机不重试。
 - 无慢worker推测执行：只做故障重派，慢任务不会被并行兜底。
 - 补算以"文件"为粒度（一个文件的分片全在同一进程）；更细粒度可按
   (文件, 分区) 重算，代价是 map 要支持按分区产出。

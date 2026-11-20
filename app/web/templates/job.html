@@ -2,8 +2,18 @@
 {% block head %}{% if not job.done %}<meta http-equiv="refresh" content="2">{% endif %}{% endblock %}
 {% block content %}
 <h1>任务 {{ job.id }}
-  <span class="badge {{ 'b-done' if job.done else 'b-run' }}">{{ phase }}</span>
+  <span class="badge {{ 'b-done' if job.done else ('b-warn' if publish else 'b-run') }}">{{ phase }}</span>
 </h1>
+
+{% if publish and not job.done %}
+<div class="card">
+  <h2>报告发布</h2>
+  <p class="warn-text">全部归并结果已接收并保留，正在发布报告（写入失败会自动重试，
+     成功后清单才显示）。</p>
+  <p>已尝试 {{ publish.fails }} 次{% if publish.last_error %}；最近一次错误：
+     <code>{{ publish.last_error }}</code>{% endif %}</p>
+</div>
+{% endif %}
 
 <div class="card">
   <h2>进度</h2>
@@ -87,7 +97,7 @@
   </table>
 </div>
 {% else %}
-<p class="muted">全部归并完成后才显示清单。</p>
+<p class="muted">{% if publish %}全部归并结果已接收，报告发布成功后显示清单。{% else %}全部归并完成后才显示清单。{% endif %}</p>
 {% endif %}
 
 <div class="card">
